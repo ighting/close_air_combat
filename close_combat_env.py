@@ -12,6 +12,59 @@ from gymnasium import spaces
 import logging
 from typing import Dict, Tuple, List, Optional
 import copy
+from dataclasses import dataclass, field
+
+
+@dataclass
+class PIDController:
+    """PID控制器"""
+    kp: float = 1.0  # 比例增益
+    ki: float = 0.0  # 积分增益
+    kd: float = 0.0  # 微分增益
+    integral: float = 0.0  # 积分项
+    prev_error: float = 0.0  # 上一次误差
+    output_min: float = -1.0  # 输出最小值
+    output_max: float = 1.0  # 输出最大值
+    integral_min: float = -10.0  # 积分项最小值
+    integral_max: float = 10.0  # 积分项最大值
+
+    def reset(self):
+        """重置控制器状态"""
+        self.integral = 0.0
+        self.prev_error = 0.0
+
+    def update(self, error: float, dt: float = 1.0) -> float:
+        """
+        更新PID控制器
+
+        Args:
+            error: 当前误差
+            dt: 时间步长（秒）
+
+        Returns:
+            control_output: 控制输出
+        """
+        # 比例项
+        p_term = self.kp * error
+
+        # 积分项（带抗饱和）
+        self.integral += error * dt
+        self.integral = np.clip(self.integral, self.integral_min, self.integral_max)
+        i_term = self.ki * self.integral
+
+        # 微分项
+        derivative = (error - self.prev_error) / dt if dt > 0 else 0.0
+        d_term = self.kd * derivative
+
+        # 计算总输出
+        output = p_term + i_term + d_term
+
+        # 更新上一次误差
+        self.prev_error = error
+
+        # 限制输出范围
+        return np.clip(output, self.output_min, self.output_max)
+
 
 # TacView支持
 try:
@@ -50,8 +103,8 @@ class CloseCombatEnv(gym.Env):
         # 默认配置
         self.config = {
             'sim_freq': 60,  # 仿真频率 Hz
-            'max_steps': 1000,  # 最大步数
-            'min_altitude': 1000,  # 最低安全高度 (m)
+            'max_steps': 5000,  # 最大步数
+            'min_altitude': 200,  # 最低安全高度 (m)
             'min_velocity': 100,  # 最低安全速度 (m/s)
             'init_distance': 5000,  # 初始距离 (m)
             'init_altitude': 5000,  # 初始高度 (m)
@@ -90,6 +143,12 @@ class CloseCombatEnv(gym.Env):
         self.current_step = 0
         self.done = False
         self.winner = None  # 'red', 'blue', 'draw', None
+
+        # PID控制器（最终优化参数）
+        self.altitude_pid = PIDController(kp=0.005, ki=0.001, kd=0.003, output_min=-0.3, output_max=0.3)
+        self.speed_pid = PIDController(kp=0.05, ki=0.01, kd=0.03, output_min=-0.2, output_max=0.2)  # 调整为相对基础油门的偏移量
+        self.pitch_pid = PIDController(kp=1.2, ki=0.3, kd=0.4, output_min=-0.3, output_max=0.3)
+        self.roll_pid = PIDController(kp=1.2, ki=0.3, kd=0.4, output_min=-0.3, output_max=0.3)
 
         # 定义观察空间
         # 观察包含：自身状态(13) + 相对状态(6) + 导弹警告(3) = 22维
@@ -165,6 +224,9 @@ class CloseCombatEnv(gym.Env):
         self.winner = None
         self.missiles = []
 
+        # 重置PID控制器
+        self._reset_pid_controllers()
+
         # 清理TacView对象
         if self.tacview_manager:
             self.tacview_manager.clear_all()
@@ -185,6 +247,14 @@ class CloseCombatEnv(gym.Env):
         }
 
         return obs, info
+
+    def _reset_pid_controllers(self):
+        """重置所有PID控制器"""
+        self.altitude_pid.reset()
+        self.speed_pid.reset()
+        self.pitch_pid.reset()
+        self.roll_pid.reset()
+        self.logger.debug("PID控制器已重置")
 
     def _create_aircraft(self):
         """创建红蓝双方飞机"""
@@ -264,7 +334,8 @@ class CloseCombatEnv(gym.Env):
             info: 额外信息
         """
         # 解析动作
-        action = self.level_flight_action(target_altitude=5000)
+        action = self.level_flight_action(
+            self.red_aircraft, target_altitude=5000)
         throttle, elevator, rudder, aileron, fire_missile = action
 
         # 应用控制输入到红色飞机（蓝色飞机由环境控制或对手控制）
@@ -302,6 +373,8 @@ class CloseCombatEnv(gym.Env):
         truncated = False
         if self.current_step >= self.config['max_steps']:
             truncated = True
+            self.logger.info(
+                f"截断条件：达到最大步数限制（{self.current_step} >= {self.config['max_steps']}），平局")
             if self.winner is None:
                 self.winner = 'draw'
 
@@ -364,9 +437,9 @@ class CloseCombatEnv(gym.Env):
 
         return np.array([throttle, elevator, rudder, aileron, fire_missile])
 
-    def level_flight_action(self, target_altitude=None, target_speed=250.0) -> np.ndarray:
+    def level_flight_action(self, aircraft, target_altitude=None, target_speed=250.0) -> np.ndarray:
         """
-        生成平飞动作
+        生成平飞动作（使用PID控制）
 
         Args:
             target_altitude: 目标高度 (m)，None表示保持当前高度
@@ -375,61 +448,87 @@ class CloseCombatEnv(gym.Env):
         Returns:
             action: 动作向量 [油门, 升降舵, 方向舵, 副翼, 发射导弹]
         """
-        # 获取当前飞机状态（针对红色飞机）
-        if self.red_aircraft is None:
+        # 获取当前飞机状态
+        if aircraft is None:
             return np.array([0.6, 0.0, 0.0, 0.0, 0.0])
 
-        current_pos = self.red_aircraft.get_position()
-        current_vel = self.red_aircraft.get_velocity()
-        current_rpy = self.red_aircraft.get_rpy()
+        current_pos = aircraft.get_position()
+        current_vel = aircraft.get_velocity()
+        current_rpy = aircraft.get_rpy()
 
         # 当前高度和速度
         current_altitude = current_pos[2]
         current_speed = np.linalg.norm(current_vel)
 
-        # 俯仰角（pitch）
+        # 俯仰角和滚转角
         current_pitch = current_rpy[1]
-
-        # 1. 油门控制：调整到目标速度
-        if current_speed < target_speed * 0.95:
-            # 速度偏低，增加油门
-            throttle = 0.7
-        elif current_speed > target_speed * 1.05:
-            # 速度偏高，减少油门
-            throttle = 0.5
-        else:
-            # 速度在目标范围内，保持油门
-            throttle = 0.6
-
-        # 2. 升降舵控制：调整到目标高度
-        if target_altitude is not None:
-            alt_error = target_altitude - current_altitude
-            if alt_error > 100:  # 高度偏低，拉起机头
-                elevator = -0.2
-            elif alt_error < -100:  # 高度偏高，压低机头
-                elevator = 0.2
-            else:
-                # 高度接近目标，根据俯仰角微调
-                # 平飞时俯仰角应该接近0
-                pitch_error = -current_pitch  # 目标俯仰角为0
-                elevator = pitch_error * 0.5  # 比例控制
-                elevator = np.clip(elevator, -0.3, 0.3)
-        else:
-            # 保持当前高度，根据俯仰角调整
-            pitch_error = -current_pitch
-            elevator = pitch_error * 0.5
-            elevator = np.clip(elevator, -0.3, 0.3)
-
-        # 3. 方向舵控制：保持航向（平飞时为0）
-        rudder = 0.0
-
-        # 4. 副翼控制：保持滚转角为0（平飞时机翼水平）
         current_roll = current_rpy[0]
-        aileron = -current_roll * 0.5  # 比例控制
+
+        # 计算时间步长（基于仿真频率）
+        dt = 1.0 / self.config['sim_freq']
+
+        # 1. 油门控制：PID控制速度
+        speed_error = target_speed - current_speed
+        pid_output = self.speed_pid.update(speed_error, dt)
+
+        # 基础油门 + PID调整
+        # F-16平飞通常需要约0.6-0.7的油门
+        base_throttle = 0.65
+        throttle = base_throttle + pid_output
+
+        # 确保油门在合理范围内
+        throttle = np.clip(throttle, 0.4, 0.9)
+
+        # 2. 升降舵控制：PID控制高度和俯仰角
+        if target_altitude is not None:
+            # 高度控制：使用PID控制高度误差
+            alt_error = target_altitude - current_altitude
+            altitude_control = self.altitude_pid.update(alt_error, dt)
+
+            # 俯仰角控制：平飞时目标俯仰角为0
+            pitch_error = -current_pitch
+            pitch_control = self.pitch_pid.update(pitch_error, dt)
+
+            # 组合高度控制和俯仰角控制
+            elevator = altitude_control + pitch_control
+        else:
+            # 保持当前高度，只控制俯仰角
+            pitch_error = -current_pitch
+            elevator = self.pitch_pid.update(pitch_error, dt)
+
+        # 限制升降舵输出范围
+        elevator = np.clip(elevator, -0.3, 0.3)
+
+        # 3. 方向舵控制：平飞时保持航向，使用简单的偏航阻尼
+        # 获取偏航角速度（yaw rate）
+        try:
+            # 尝试从飞机获取角速度
+            angular_vel = aircraft.get_angular_velocity()
+            yaw_rate = angular_vel[2] if len(angular_vel) > 2 else 0.0
+        except:
+            yaw_rate = 0.0
+
+        # 简单的偏航阻尼：抑制偏航角速度
+        rudder = -yaw_rate * 0.1
+        rudder = np.clip(rudder, -0.2, 0.2)
+
+        # 4. 副翼控制：PID控制滚转角
+        roll_error = -current_roll  # 目标滚转角为0（机翼水平）
+        aileron = self.roll_pid.update(roll_error, dt)
         aileron = np.clip(aileron, -0.3, 0.3)
 
         # 5. 不发射导弹
         fire_missile = 0.0
+
+        # 记录控制信息（调试用）
+        if self.current_step % 100 == 0:
+            self.logger.debug(
+                f"PID控制: 高度误差={alt_error if target_altitude is not None else 'N/A':.1f}m, "
+                f"速度误差={speed_error:.1f}m/s, "
+                f"俯仰角={np.degrees(current_pitch):.1f}°, "
+                f"滚转角={np.degrees(current_roll):.1f}°, "
+                f"油门={throttle:.3f}, 升降舵={elevator:.3f}, 副翼={aileron:.3f}"
+            )
 
         return np.array([throttle, elevator, rudder, aileron, fire_missile])
 
@@ -497,9 +596,11 @@ class CloseCombatEnv(gym.Env):
         """
         # 检查是否被击中
         if not self.red_aircraft.is_alive:
+            self.logger.info(f"终止条件：红色飞机被击中，蓝色获胜")
             return True, 'blue'
 
         if not self.blue_aircraft.is_alive:
+            self.logger.info(f"终止条件：蓝色飞机被击中，红色获胜")
             return True, 'red'
 
         # 检查坠毁（高度太低）
@@ -507,10 +608,14 @@ class CloseCombatEnv(gym.Env):
         blue_altitude = self.blue_aircraft.get_geodetic()[2]
 
         if red_altitude < self.config['min_altitude']:
+            self.logger.info(
+                f"终止条件：红色飞机坠毁（高度{red_altitude:.1f}m < 最低安全高度{self.config['min_altitude']}m），蓝色获胜")
             self.red_aircraft.crash()
             return True, 'blue'
 
         if blue_altitude < self.config['min_altitude']:
+            self.logger.info(
+                f"终止条件：蓝色飞机坠毁（高度{blue_altitude:.1f}m < 最低安全高度{self.config['min_altitude']}m），红色获胜")
             self.blue_aircraft.crash()
             return True, 'red'
 
@@ -519,10 +624,14 @@ class CloseCombatEnv(gym.Env):
         blue_velocity = np.linalg.norm(self.blue_aircraft.get_velocity())
 
         if red_velocity < self.config['min_velocity']:
+            self.logger.info(
+                f"终止条件：红色飞机失速（速度{red_velocity:.1f}m/s < 最低安全速度{self.config['min_velocity']}m/s），蓝色获胜")
             self.red_aircraft.crash()
             return True, 'blue'
 
         if blue_velocity < self.config['min_velocity']:
+            self.logger.info(
+                f"终止条件：蓝色飞机失速（速度{blue_velocity:.1f}m/s < 最低安全速度{self.config['min_velocity']}m/s），红色获胜")
             self.blue_aircraft.crash()
             return True, 'red'
 
@@ -681,8 +790,27 @@ class CloseCombatEnv(gym.Env):
             f"Blue Missiles Left: {self.blue_aircraft.num_left_missiles}")
         print(f"Active Missiles: {len(self.missiles)}")
 
+        # 显示飞机状态详细信息
+        if self.red_aircraft.is_alive:
+            red_altitude = self.red_aircraft.get_geodetic()[2]
+            red_velocity = np.linalg.norm(self.red_aircraft.get_velocity())
+            # print(
+            #     f"Red Altitude: {red_altitude:.1f}m (min: {self.config['min_altitude']}m)")
+            # print(
+            #     f"Red Velocity: {red_velocity:.1f}m/s (min: {self.config['min_velocity']}m/s)")
+
+        if self.blue_aircraft.is_alive:
+            blue_altitude = self.blue_aircraft.get_geodetic()[2]
+            blue_velocity = np.linalg.norm(self.blue_aircraft.get_velocity())
+            # print(
+            #     f"Blue Altitude: {blue_altitude:.1f}m (min: {self.config['min_altitude']}m)")
+            # print(
+            #     f"Blue Velocity: {blue_velocity:.1f}m/s (min: {self.config['min_velocity']}m/s)")
+
         if self.done:
             print(f"Episode ended. Winner: {self.winner}")
+            print(
+                f"Steps taken: {self.current_step}/{self.config['max_steps']}")
 
     def _render_tacview(self):
         """TacView实时通信渲染"""

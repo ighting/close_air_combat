@@ -41,9 +41,9 @@ HandShakeData3 = 'alpha_dog_fight\n'
 # 其他可选参数：HDG 航向角、AGL 飞机离地高度、IAS 指示空速、TAS 真空速等等
 TelFileHeader = "FileType=text/acmi/tacview\nFileVersion=2.1\n"
 TelReferenceTimeFormat = '0,ReferenceTime=%Y-%m-%dT%H:%M:%SZ\n'
-TelDataFormat = '#%.2f\n3000102,T=%.7f|%.7f|%.7f|%.1f|%.1f|%.1f,AGL=%.3f,TAS=%.3f,CAS=%.3f,Type=Air+FixedWing,Name=Airbus A320,Color=Red,Coalition=Allies\n'
-TelDataFormat_target = '#%.2f\n3000102,T=%.7f|%.7f|%.7f,Type=Air+FixedWing,Name=Airbus A320,Color=Blue,Coalition=Allies\n'
-TelDataFormat_less = '#%.2f\n%s,T=%.7f|%.7f|%.7f|%.1f|%.1f|%.1f,Type=Air+FixedWing,Name=Airbus A320,Color=%s,Coalition=Allies\n'
+TelDataFormat = '#%.2f\n3000102,T=%.7f|%.7f|%.7f|%.1f|%.1f|%.1f,AGL=%.3f,TAS=%.3f,CAS=%.3f,Type=Air+FixedWing,Name=F16,Color=Red,Coalition=Allies\n'
+TelDataFormat_target = '#%.2f\n3000102,T=%.7f|%.7f|%.7f,Type=Air+FixedWing,Name=F16,Color=Blue,Coalition=Allies\n'
+TelDataFormat_less = '#%.2f\n%s,T=%.7f|%.7f|%.7f|%.1f|%.1f|%.1f,Type=Air+FixedWing,Name=F16,Color=%s,Coalition=Allies\n'
 # 定义TCP IP通信端口
 LOCALPORT = 58008
 LOCALIP = '127.0.0.1'
@@ -125,7 +125,7 @@ class TacviewClient:
         return time.time() - self._start_time
 
     def update_aircraft(self, aircraft_uid, color, longitude, latitude, altitude,
-                       roll, pitch, heading, tas=None, agl=None):
+                        roll, pitch, heading, tas=None, agl=None):
         """
         更新飞机状态
 
@@ -185,7 +185,7 @@ class TacviewClient:
             print(f"更新飞机状态失败: {e}")
 
     def update_missile(self, missile_uid, color, longitude, latitude, altitude,
-                      roll, pitch, heading):
+                       roll, pitch, heading):
         """
         更新导弹状态
 
@@ -297,7 +297,8 @@ class TacviewClient:
             self.so.send(definition.encode('utf-8'))
 
             # 发送爆炸位置数据
-            data = f'#{elapsed:.2f}\n{obj_id},T=%.7f|%.7f|%.7f\n' % (longitude, latitude, altitude)
+            data = f'#{elapsed:.2f}\n{obj_id},T=%.7f|%.7f|%.7f\n' % (
+                longitude, latitude, altitude)
             self.so.send(data.encode('utf-8'))
 
         except Exception as e:
